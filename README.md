@@ -1,82 +1,82 @@
-# Non-Stationary Learning
+# Stream Buffer
 
-Tests whether **context-conditioned reinforcement learning** can solve non-stationary sequential decision problems — environments whose dynamics, rewards, or structure change over time so that a fixed policy fails.
+Token stream storage backed by memory-mapped numpy buffers, with HuggingFace Dataset I/O.
 
-The agent conditions on history via a transformer, adapting through its latent representation at inference time rather than through gradient steps. Evaluated on [NS-Gym](https://nsgym.io): Gymnasium environments with configurable non-stationarity.
+## Overview
+
+`StreamStore` holds a flat token stream in a single memory-mapped numpy buffer. Each token is a structured record of `(step, type, data)` — where `data` stores any float or int as raw float64 bits. This lets the store handle variable-length observations, discrete actions, scalar rewards, and boolean done flags in a uniform, schema-free layout.
+
+**Key properties:**
+
+- **Variable-length fields** — no fixed length required; each step can have a different number of tokens per field.
+- **Dynamic capacity** — the underlying `MemmapBuffer` grows in chunks as tokens are appended; no pre-allocation needed.
+- **HuggingFace round-trip** — `to_dataset()` / `from_dataset()` convert between the token stream and a columnar HuggingFace `Dataset`.
+- **Arbitrary index shapes** — `__getitem__` accepts an index array of any shape and returns `{"types": int64[...], "values": int64[...]}` with matching batch dimensions. Reinterpret `values` as float64 via `.view(np.float64)` when needed.
+
+## Core API
+
+```python
+from stream_store import StreamStore
+import numpy as np
+
+store = StreamStore(fields=["action", "observation", "reward", "done"])
+
+# Append one step (flat parallel sequences: one entry per field)
+store.append(
+    steps=[0, 0, 0, 0],
+    names=["action", "observation", "reward", "done"],
+    values=[1, np.array([0.1, -0.2, 0.05, 0.3]), 1.0, False],
+)
+
+# Sample by flat token indices (any shape)
+batch = store[np.array([0, 1, 2, 3, 4])]
+# batch["types"]  → int64 array of type IDs
+# batch["values"] → int64 raw bits; use .view(np.float64) to reinterpret
+
+# Convert to HuggingFace Dataset
+ds = store.to_dataset()
+
+# Load back (dataset columns must match store fields and be in construction order)
+store2 = StreamStore(fields=["action", "observation", "reward", "done"])
+store2.from_dataset(ds)
+```
+
+## Token layout
+
+Each step appended produces tokens in field order. For `["action", "observation", "reward", "done"]` with a 4-D observation:
+
+```
+action (1 token) | obs_0 … obs_3 (4 tokens) | reward (1 token) | done (1 token)
+```
+
+All values are cast to `float64` and stored as raw `int64` bit patterns — lossless for ints up to 2^53 and exact for float64 payloads.
+
+## Field definitions
+
+Pass a list of field names at construction. Type IDs are auto-assigned as consecutive integers (0, 1, 2, …) in that order:
+
+```python
+store = StreamStore(fields=["action", "observation", "reward", "done"])
+# action=0, observation=1, reward=2, done=3
+```
+
+Fields must appear in construction order when calling `append`. The dataset columns must match this order for `from_dataset` to succeed.
+
+## Dataset schema
+
+`to_dataset()` produces field columns in construction order:
+
+```
+action, observation, reward, done
+```
+
+Use `extra` for per-step columns that are not part of the token stream (e.g. provenance, episode IDs).
 
 ## Setup
 
 ```bash
 source install.sh
 ```
-
-## Running
-
-All runs go through `run.sh` with a config file:
-
-```bash
-./run.sh configs/<config>.yaml
-```
-
-### Collect rollout data
-
-Set `train_interval: 0` and define `test_envs`. Set `save_dataset.name` to push the dataset to Hugging Face.
-
-```bash
-./run.sh configs/test_random_small.yaml
-```
-
-### Train
-
-Set `load_train_dataset.name` to a Hugging Face dataset repo. `train_interval: 1` is the default when a train dataset is provided.
-
-```bash
-./run.sh configs/train.yaml
-```
-
-Optionally enable eval (`eval_interval > 0`) and online test rollouts (`test_interval > 0`) within the same run.
-
-## Config reference
-
-| Key | Description |
-|---|---|
-| `q_training.train_interval` | Train every N steps. `0` = rollout-only (no training). |
-| `q_training.eval_interval` | Eval every N steps. `0` = disabled. Requires `load_eval_dataset`. |
-| `q_training.test_interval` | Online test rollout every N train steps. `0` = disabled. |
-| `test_envs` | Dict of environments to roll out in. Each entry specifies `id`, `num_envs`, `num_steps`, `policy`, and optionally `non_stationary_params`. |
-| `save_dataset.name` | Hugging Face repo id to push rollout data to. `null` = skip. |
-
-## Dataset schema
-
-Columns are always written in this order:
-
-```
-env_name, env_number, step_id, action, observation, reward, done
-```
-
-## Non-stationary environments
-
-Add `non_stationary_params` to any env config to use [NS-Gym](https://nsgym.io) schedulers:
-
-```yaml
-test_envs:
-  cartpole_ns:
-    id: CartPole-v1
-    num_envs: 20
-    num_steps: 1000
-    policy: random
-    non_stationary_params:
-      gravity:
-        scheduler: "periodic"
-        update_function: "random_walk"
-        scheduler_kwargs:
-          period: 10
-        update_kwargs:
-          sigma: 0.5
-          mu: 0.0
-```
-
-See the [NS-Gym docs](https://nsgym.io) and [paper](https://openreview.net/pdf?id=YOXZuRy40U) for available schedulers and update functions.
 
 ## Tests
 

@@ -4,7 +4,7 @@ Encodes all desired behaviours:
   - append individual fields with caller-supplied step index
   - 1-D, 2-D and N-D __getitem__ returning a TensorDict
   - from_dataset → to_dataset roundtrip (core fields + extra)
-  - Variable-length observation support (no hardcoded obs_dim)
+  - Variable-length field support (no hardcoded field length)
   - step field enables type-driven reconstruction without shape assumptions
   - np.memmap storage: numpy-only internals, torch only at __getitem__ boundary
   - Dynamic capacity (buffer grows as needed)
@@ -24,8 +24,16 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from datasets import Dataset, Features, Sequence as HFSequence, Value
-from definitions import FIELD_TO_TYPE, TokenType
 from stream_store import StreamStore
+
+# Fields used throughout these tests — type IDs are auto-assigned 0, 1, 2, 3.
+FIELDS = ["action", "observation", "reward", "done"]
+
+# Integer type IDs for assertion use (matches auto-assignment order above).
+_ACTION_TYPE      = 0
+_OBS_TYPE         = 1
+_REWARD_TYPE      = 2
+_DONE_TYPE        = 3
 
 
 # ---------------------------------------------------------------------------
@@ -36,13 +44,12 @@ OBS_DIM = 4
 
 
 def _make_store(capacity: int = 4096) -> StreamStore:
-    return StreamStore(field_to_type=FIELD_TO_TYPE, env_name="test_env", env_number=0, capacity=capacity)
+    return StreamStore(fields=FIELDS, capacity=capacity)
 
 
 def _core_columns(ds: Dataset) -> Dataset:
-    """Keep only columns known to FIELD_TO_TYPE, in canonical token order."""
-    canonical = list(FIELD_TO_TYPE.keys())
-    return Dataset.from_dict({c: ds[c] for c in canonical if c in ds.column_names})
+    """Keep only columns known to FIELDS, in canonical token order."""
+    return Dataset.from_dict({c: ds[c] for c in FIELDS if c in ds.column_names})
 
 
 def _make_dataset(num_rows: int = 20, obs_dim: int = OBS_DIM) -> Dataset:
@@ -91,26 +98,43 @@ def test_append_token_count():
     obs_dim = 4
     store = _make_store()
     obs = np.zeros(obs_dim, dtype=np.float32)
-    store.append(["action", "observation", "reward", "done"], [0, obs, 0.0, False], step=0)
+    store.append(steps=[0, 0, 0, 0], names=["action", "observation", "reward", "done"],
+                 values=[0, obs, 0.0, False])
     assert len(store) == obs_dim + 3  # action + 4 obs + reward + done = 7
 
 
 def test_append_accumulates():
     obs_dim = 4
     N = 10
+    fields = ["action", "observation", "reward", "done"]
     store = _make_store()
     for i in range(N):
-        store.append(["action", "observation", "reward", "done"],
-                     [i % 3, np.ones(obs_dim) * i, float(i), False], step=i)
+        store.append(steps=[i] * 4, names=fields,
+                     values=[i % 3, np.ones(obs_dim) * i, float(i), False])
     assert len(store) == N * (obs_dim + 3)
+
+
+def test_append_multi_step_inserts_in_order():
+    """Batched append writes tokens in step order."""
+    obs_dim = 2
+    N = 3
+    fields = ["action", "observation", "reward", "done"]
+    store = _make_store()
+    for i in range(N):
+        store.append(steps=[i] * 4, names=fields,
+                     values=[i, np.ones(obs_dim) * i, float(i), False])
+    raw = store._buf[:]
+    tps = obs_dim + 3
+    for i in range(N):
+        assert (raw["step"][i * tps:(i + 1) * tps] == i).all()
 
 
 def test_append_step_stored_in_buffer():
     """Every token from a call gets the step value passed by the caller."""
     store = _make_store()
     obs = np.array([1.0, 2.0], dtype=np.float32)
-    store.append(["action", "observation", "reward", "done"], [1, obs, 0.5, False], step=42)
-    # Read the live buffer directly to verify step values.
+    store.append(steps=[42, 42, 42, 42], names=["action", "observation", "reward", "done"],
+                 values=[1, obs, 0.5, False])
     raw = store._buf[:]
     assert (raw["step"] == 42).all()
 
@@ -118,10 +142,9 @@ def test_append_step_stored_in_buffer():
 def test_append_allows_variable_obs_dim():
     """Different steps may have different obs_dim — no error should be raised."""
     store = _make_store(capacity=500)
-    store.append(["action", "observation", "reward", "done"],
-                 [0, np.zeros(3), 0.0, False], step=0)
-    store.append(["action", "observation", "reward", "done"],
-                 [0, np.zeros(5), 0.0, False], step=1)
+    fields = ["action", "observation", "reward", "done"]
+    store.append(steps=[0] * 4, names=fields, values=[0, np.zeros(3), 0.0, False])
+    store.append(steps=[1] * 4, names=fields, values=[0, np.zeros(5), 0.0, False])
     assert len(store) == (3 + 3) + (5 + 3)
 
 
@@ -130,13 +153,13 @@ def test_split_append_same_step():
     obs_dim = 3
     store = _make_store()
     obs = np.array([1.0, 2.0, 3.0], dtype=np.float32)
-    store.append(["action"], [2], step=7)
+    store.append(steps=[7], names=["action"], values=[2])
     assert len(store) == 1
 
-    store.append(["observation", "reward", "done"], [obs, 0.5, False], step=7)
+    store.append(steps=[7, 7, 7], names=["observation", "reward", "done"],
+                 values=[obs, 0.5, False])
     assert len(store) == obs_dim + 3
 
-    # Both appends share step=7.
     raw = store._buf[:]
     assert (raw["step"] == 7).all()
 
@@ -144,20 +167,61 @@ def test_split_append_same_step():
 def test_append_unknown_field_raises():
     store = _make_store()
     with pytest.raises(ValueError, match="Unknown field"):
-        store.append(["bad_field"], [1.0], step=0)
+        store.append(steps=[0], names=["bad_field"], values=[1.0])
 
 
-def test_append_mismatched_lengths_raises():
+def test_append_unequal_lengths_raises():
     store = _make_store()
     with pytest.raises(ValueError):
-        store.append(["observation", "reward"], [np.zeros(4)], step=0)
+        store.append(steps=[0, 1], names=["action"], values=[0])
+
+
+def test_append_out_of_order_raises():
+    store = _make_store()
+    with pytest.raises(ValueError, match="order"):
+        store.append(steps=[0, 0], names=["reward", "action"], values=[0.0, 1])
+
+
+def test_append_reversed_order_raises():
+    store = _make_store()
+    with pytest.raises(ValueError, match="order"):
+        store.append(steps=[0, 0, 0], names=["done", "observation", "reward"],
+                     values=[False, np.zeros(2), 0.0])
+
+
+def test_append_skipping_fields_preserves_order():
+    """Missing fields are fine as long as present fields stay in canonical order."""
+    store = _make_store()
+    store.append(steps=[0, 0, 0], names=["action", "reward", "done"], values=[1, 0.5, False])
+    assert len(store) == 3
+
+
+def test_split_append_order_enforced():
+    """Each split append call must itself be in order."""
+    store = _make_store()
+    store.append(steps=[0], names=["action"], values=[0])
+    store.append(steps=[0, 0, 0], names=["observation", "reward", "done"],
+                 values=[np.zeros(2), 0.5, False])
+    with pytest.raises(ValueError, match="order"):
+        store.append(steps=[1, 1], names=["done", "reward"], values=[False, 0.0])
+
+
+def test_cross_call_order_enforced():
+    """Order state persists across append calls — the buffer's last token defines what comes next."""
+    store = _make_store()
+    # Write action + observation for step 0.
+    store.append(steps=[0, 0], names=["action", "observation"], values=[0, np.zeros(2)])
+    # Trying to re-insert action for the same step must fail.
+    with pytest.raises(ValueError, match="order"):
+        store.append(steps=[0], names=["action"], values=[1])
 
 
 def test_append_grows_beyond_initial_capacity():
     """NumpyMemmapBuffer grows dynamically; initial capacity is just a chunk-size hint."""
     store = _make_store(capacity=3)
     obs = np.array([1.0, 2.0, 3.0], dtype=np.float32)
-    store.append(["action", "observation", "reward", "done"], [1, obs, 0.5, False], step=0)
+    store.append(steps=[0, 0, 0, 0], names=["action", "observation", "reward", "done"],
+                 values=[1, obs, 0.5, False])
     assert len(store) == 6
 
 
@@ -170,51 +234,60 @@ def test_getitem_1d_types():
     obs_dim = 2
     store = _make_store()
     obs = np.array([1.0, 2.0], dtype=np.float32)
-    store.append(["action", "observation", "reward", "done"], [1, obs, 0.5, True], step=0)
+    store.append(steps=[0, 0, 0, 0], names=["action", "observation", "reward", "done"],
+                 values=[1, obs, 0.5, True])
     result = store[torch.tensor([1, 2])]
-    assert result["types"].tolist() == [int(TokenType.OBS), int(TokenType.OBS)]
+    assert result["types"].tolist() == [_OBS_TYPE, _OBS_TYPE]
 
 
 def test_getitem_reward_token():
     obs_dim = 2
     store = _make_store()
     obs = np.zeros(obs_dim, dtype=np.float32)
-    store.append(["action", "observation", "reward", "done"], [0, obs, 9.9, False], step=0)
-    # New ordering: action(0), obs(1..obs_dim), reward(obs_dim+1), done(obs_dim+2)
+    store.append(steps=[0, 0, 0, 0], names=["action", "observation", "reward", "done"],
+                 values=[0, obs, 9.9, False])
     result = store[torch.tensor([obs_dim + 1])]
-    assert result["types"].tolist() == [int(TokenType.REWARD)]
-    assert result["values"][0].item() == pytest.approx(9.9, rel=1e-4)
+    assert result["types"].tolist() == [_REWARD_TYPE]
+    val = result["values"][0:1].view(np.float64)[0]
+    assert val == pytest.approx(9.9, rel=1e-4)
 
 
 def test_getitem_done_token():
     obs_dim = 2
     store = _make_store()
     obs = np.zeros(obs_dim, dtype=np.float32)
-    store.append(["action", "observation", "reward", "done"], [0, obs, 0.0, True], step=0)
-    # New ordering: action(0), obs(1..obs_dim), reward(obs_dim+1), done(obs_dim+2)
+    store.append(steps=[0, 0, 0, 0], names=["action", "observation", "reward", "done"],
+                 values=[0, obs, 0.0, True])
     result = store[torch.tensor([obs_dim + 2])]
-    assert result["types"].tolist() == [int(TokenType.DONE)]
-    assert bool(result["values"][0].item()) is True
+    assert result["types"].tolist() == [_DONE_TYPE]
+    val = result["values"][0:1].view(np.float64)[0]
+    assert bool(val) is True
 
 
 def test_getitem_action_token():
     obs_dim = 2
     store = _make_store()
     obs = np.zeros(obs_dim, dtype=np.float32)
-    store.append(["action", "observation", "reward", "done"], [7, obs, 0.0, False], step=0)
-    # New ordering: action is first (position 0)
+    store.append(steps=[0, 0, 0, 0], names=["action", "observation", "reward", "done"],
+                 values=[7, obs, 0.0, False])
     result = store[torch.tensor([0])]
-    assert result["types"].tolist() == [int(TokenType.ACTION)]
-    assert result["values"][0].item() == pytest.approx(7.0)
+    assert result["types"].tolist() == [_ACTION_TYPE]
+    val = result["values"][0:1].view(np.float64)[0]
+    assert int(val) == 7
+
+
+def _append_steps(store, N, obs_dim):
+    fields = ["action", "observation", "reward", "done"]
+    for i in range(N):
+        store.append(steps=[i] * 4, names=fields,
+                     values=[i, np.ones(obs_dim) * i, float(i), False])
 
 
 def test_getitem_3d_shape():
     obs_dim = 2
     N, tps = 4, obs_dim + 3
     store = _make_store()
-    for i in range(N):
-        store.append(["action", "observation", "reward", "done"],
-                     [i, np.ones(obs_dim) * i, float(i), False], step=i)
+    _append_steps(store, N, obs_dim)
     idx = torch.arange(N * tps).reshape(2, 2, tps)
     result = store[idx]
     assert result["types"].shape == (2, 2, tps)
@@ -224,9 +297,7 @@ def test_getitem_2d_shape():
     obs_dim = 3
     N, tps = 5, obs_dim + 3
     store = _make_store()
-    for i in range(N):
-        store.append(["action", "observation", "reward", "done"],
-                     [i, np.ones(obs_dim) * i, float(i), False], step=i)
+    _append_steps(store, N, obs_dim)
     result = store[torch.arange(N * tps).reshape(N, tps)]
     assert result["types"].shape == (N, tps)
 
@@ -235,90 +306,82 @@ def test_getitem_2d_types():
     obs_dim = 3
     N, tps = 4, obs_dim + 3
     store = _make_store()
-    for i in range(N):
-        store.append(["action", "observation", "reward", "done"],
-                     [i, np.ones(obs_dim) * i, float(i), False], step=i)
+    _append_steps(store, N, obs_dim)
     result = store[torch.arange(N * tps).reshape(N, tps)]
     types = result["types"]
-    # New ordering per step: action(0), obs(1..obs_dim), reward(obs_dim+1), done(obs_dim+2)
-    assert (types[:, 0] == int(TokenType.ACTION)).all()
-    assert (types[:, 1:obs_dim + 1] == int(TokenType.OBS)).all()
-    assert (types[:, obs_dim + 1] == int(TokenType.REWARD)).all()
-    assert (types[:, obs_dim + 2] == int(TokenType.DONE)).all()
+    assert (types[:, 0] == _ACTION_TYPE).all()
+    assert (types[:, 1:obs_dim + 1] == _OBS_TYPE).all()
+    assert (types[:, obs_dim + 1] == _REWARD_TYPE).all()
+    assert (types[:, obs_dim + 2] == _DONE_TYPE).all()
 
 
 def test_getitem_context_window():
     obs_dim = 2
     tps = obs_dim + 3
     N = 5
+    fields = ["action", "observation", "reward", "done"]
     store = _make_store()
     for i in range(N):
-        obs = np.array([float(i), float(i + 1)], dtype=np.float32)
-        store.append(["action", "observation", "reward", "done"],
-                     [0, obs, float(i), False], step=i)
+        store.append(steps=[i] * 4, names=fields,
+                     values=[0, np.array([float(i), float(i + 1)], dtype=np.float32),
+                             float(i), False])
     K = 2 * tps
     ctx = store[torch.arange(len(store) - K, len(store))]
     assert ctx["types"].shape == (K,)
-    # New ordering: first token of window is action of step N-2 (value = 0.0)
-    assert ctx["values"][0].item() == pytest.approx(0.0, abs=1e-5)
+    # First token of window is action of step N-2 (value = 0.0).
+    # float64(0.0) has bit pattern 0, so raw int64 is also 0.
+    assert ctx["values"][0].item() == 0
 
 
 def test_getitem_returns_tensors():
     store = _make_store()
-    store.append(["action", "observation", "reward", "done"],
-                 [0, np.zeros(2), 0.0, False], step=0)
+    store.append(steps=[0, 0, 0, 0], names=["action", "observation", "reward", "done"],
+                 values=[0, np.zeros(2), 0.0, False])
     result = store[torch.tensor([0])]
     assert isinstance(result["types"], np.ndarray)
     assert isinstance(result["values"], np.ndarray)
-    assert result["values"].dtype == np.float64
+    assert result["values"].dtype == np.int64
 
 
-def test_getitem_bit_reinterpretation():
-    """All values are stored as float64 raw bits (int64) and recovered via view.
+def test_getitem_raw_bits():
+    """__getitem__ returns raw int64 bit patterns; callers reinterpret via .view(float64).
 
-    Checks four properties:
-      1. Float payload is recovered exactly (no rounding — float64 roundtrip).
-      2. Integer payload (action, done) is recovered exactly when cast back to int.
-      3. Large integer (2^20) fits without precision loss (float64 is exact up to 2^53).
-      4. numpy's .view(np.int64) on the returned float64 array yields the same bit
-         pattern that was originally stored — proving the chain is lossless end-to-end.
+    Checks:
+      1. Returned dtype is int64.
+      2. Raw bits match float64(value).view(int64) for every token type.
+      3. Callers can recover original values by viewing the array as float64.
+      4. Large integers (2^20) survive losslessly — float64 is exact up to 2^53.
     """
-    obs_val = np.pi          # high-precision float (not representable in float32)
+    obs_val = np.pi
     reward  = -273.15
     done    = True
-    action  = 2 ** 20        # large int, well within float64's exact integer range
+    action  = 2 ** 20
 
     store = _make_store()
     store.append(
-        ["action", "observation", "reward", "done"],
-        [action, np.array([obs_val]), reward, done],
-        step=0,
+        steps=[0, 0, 0, 0],
+        names=["action", "observation", "reward", "done"],
+        values=[action, np.array([obs_val]), reward, done],
     )
 
-    # 4 tokens: action, obs, reward, done
     vals = store[np.arange(4)]["values"]
-    assert vals.dtype == np.float64
 
-    # 1. Action integer recovered exactly (now first)
-    assert int(vals[0].item()) == action
+    # 1. dtype is raw int64
+    assert vals.dtype == np.int64
 
-    # 2. Float obs preserved exactly (float64 roundtrip, not float32)
-    assert vals[1].item() == obs_val
-
-    # 3. Float reward preserved exactly
-    assert vals[2].item() == reward
-
-    # 4. Done (bool→1.0) casts back to True without loss
-    assert bool(vals[3].item()) is done
-
-    # numpy-level: view the float64 array as int64 — should match the bits
-    # that were originally stored (float64(value).view(int64)).
+    # 2. Raw bits match float64(value).view(int64)
     for token_idx, value in [(0, float(action)), (1, obs_val), (2, reward), (3, float(done))]:
         expected_bits = int(np.float64(value).view(np.int64))
-        stored_bits  = vals[token_idx : token_idx + 1].view(np.int64)[0].item()
-        assert stored_bits == expected_bits, (
-            f"Token {token_idx}: expected bits {expected_bits}, got {stored_bits}"
+        assert vals[token_idx].item() == expected_bits, (
+            f"Token {token_idx}: expected bits {expected_bits}, got {vals[token_idx].item()}"
         )
+
+    # 3. Caller reinterprets bits as float64 to recover original values
+    vals_f64 = vals.view(np.float64)
+    assert int(vals_f64[0]) == action
+    assert vals_f64[1] == obs_val
+    assert vals_f64[2] == reward
+    assert bool(vals_f64[3]) is done
 
 
 # ---------------------------------------------------------------------------
@@ -375,17 +438,17 @@ def test_from_dataset_step_values():
     obs_dim = 2
     ds = Dataset.from_dict(
         {
+            "action": [0] * num_rows,
             "observation": [[float(i)] * obs_dim for i in range(num_rows)],
             "reward": [float(i) for i in range(num_rows)],
             "done": [False] * num_rows,
-            "action": [0] * num_rows,
         },
         features=Features(
             {
+                "action": Value("int64"),
                 "observation": HFSequence(Value("float32")),
                 "reward": Value("float32"),
                 "done": Value("bool"),
-                "action": Value("int64"),
             }
         ),
     )
@@ -404,17 +467,17 @@ def test_roundtrip_no_metadata():
     observations = [[float(i * obs_dim + d) for d in range(obs_dim)] for i in range(num_rows)]
     ds = Dataset.from_dict(
         {
+            "action": [i % 4 for i in range(num_rows)],
             "observation": observations,
             "reward": [float(i) * 0.2 for i in range(num_rows)],
             "done": [i % 5 == 4 for i in range(num_rows)],
-            "action": [i % 4 for i in range(num_rows)],
         },
         features=Features(
             {
+                "action": Value("int64"),
                 "observation": HFSequence(Value("float32")),
                 "reward": Value("float32"),
                 "done": Value("bool"),
-                "action": Value("int64"),
             }
         ),
     )
@@ -439,10 +502,10 @@ def test_to_dataset_extra_string_column():
     num_rows = 10
     ds = Dataset.from_dict(
         {
+            "action": [0] * num_rows,
             "observation": [[float(i)] for i in range(num_rows)],
             "reward": [float(i) for i in range(num_rows)],
             "done": [False] * num_rows,
-            "action": [0] * num_rows,
         },
         features=Features(
             {
@@ -466,10 +529,10 @@ def test_to_dataset_extra_wrong_length_raises():
     num_rows = 5
     ds = Dataset.from_dict(
         {
+            "action": [0] * num_rows,
             "observation": [[0.0] for _ in range(num_rows)],
             "reward": [0.0] * num_rows,
             "done": [False] * num_rows,
-            "action": [0] * num_rows,
         },
         features=Features(
             {
@@ -494,17 +557,16 @@ def test_to_dataset_extra_wrong_length_raises():
 def test_to_dataset_after_appends():
     obs_dim = 3
     N = 8
+    act_vals  = [i % 3 for i in range(N)]
+    obs_vals  = [(np.arange(obs_dim, dtype=np.float32) + i * obs_dim).tolist() for i in range(N)]
+    rew_vals  = [float(i) * 0.1 for i in range(N)]
+    done_vals = [i == N - 1 for i in range(N)]
+
     store = _make_store()
-    obs_vals, rew_vals, done_vals, act_vals = [], [], [], []
     for i in range(N):
-        obs = np.arange(obs_dim, dtype=np.float32) + i * obs_dim
-        rew, done, act = float(i) * 0.1, i == N - 1, i % 3
-        obs_vals.append(obs.tolist())
-        rew_vals.append(rew)
-        done_vals.append(done)
-        act_vals.append(act)
-        store.append(["action", "observation", "reward", "done"],
-                     [act, obs, rew, done], step=i)
+        store.append(steps=[i] * 4, names=["action", "observation", "reward", "done"],
+                     values=[act_vals[i], np.array(obs_vals[i], dtype=np.float32),
+                             rew_vals[i], done_vals[i]])
 
     ds = store.to_dataset()
     assert len(ds) == N
@@ -520,13 +582,12 @@ def test_to_dataset_split_appends():
     obs_dim = 2
     N = 5
     store = _make_store()
-    obs_vals, act_vals = [], []
+    obs_vals = [[float(i), float(i + 1)] for i in range(N)]
+    act_vals = [i % 4 for i in range(N)]
     for i in range(N):
-        obs = np.array([float(i), float(i + 1)], dtype=np.float32)
-        obs_vals.append(obs.tolist())
-        store.append(["action"], [i % 4], step=i)
-        store.append(["observation", "reward", "done"], [obs, float(i), False], step=i)
-        act_vals.append(i % 4)
+        store.append(steps=[i], names=["action"], values=[act_vals[i]])
+        store.append(steps=[i, i, i], names=["observation", "reward", "done"],
+                     values=[np.array(obs_vals[i], dtype=np.float32), float(i), False])
 
     ds = store.to_dataset()
     assert len(ds) == N
@@ -542,8 +603,10 @@ def test_to_dataset_variable_obs_dim():
     obs3 = np.array([1.0, 2.0, 3.0], dtype=np.float32)
     obs5 = np.array([4.0, 5.0, 6.0, 7.0, 8.0], dtype=np.float32)
 
-    store.append(["action", "observation", "reward", "done"], [0, obs3, 0.1, False], step=0)
-    store.append(["action", "observation", "reward", "done"], [1, obs5, 0.2, True], step=1)
+    store.append(steps=[0] * 4, names=["action", "observation", "reward", "done"],
+                 values=[0, obs3, 0.1, False])
+    store.append(steps=[1] * 4, names=["action", "observation", "reward", "done"],
+                 values=[1, obs5, 0.2, True])
 
     ds = store.to_dataset()
     assert len(ds) == 2
@@ -566,12 +629,15 @@ def test_empty_store_raises_on_to_dataset():
         store.to_dataset()
 
 
-def test_no_complete_steps_raises_on_to_dataset():
+def test_partial_fields_produce_valid_dataset():
+    """to_dataset works with any subset of the declared fields."""
     store = _make_store()
-    store.append(["observation", "reward", "done"],
-                 [np.zeros(3), 0.5, False], step=0)
-    with pytest.raises(ValueError, match="complete steps"):
-        store.to_dataset()
+    store.append(steps=[0, 0, 0], names=["observation", "reward", "done"],
+                 values=[np.zeros(3), 0.5, False])
+    ds = store.to_dataset()
+    assert len(ds) == 1
+    assert "observation" in ds.column_names
+    assert "action" not in ds.column_names
 
 
 def test_from_dataset_grows_beyond_initial_capacity():
@@ -583,13 +649,23 @@ def test_from_dataset_grows_beyond_initial_capacity():
 
 def test_zero_capacity_raises():
     with pytest.raises(ValueError):
-        StreamStore(field_to_type=FIELD_TO_TYPE, env_name="test_env", env_number=0, capacity=0)
+        StreamStore(fields=FIELDS, capacity=0)
+
+
+def test_duplicate_fields_raises():
+    with pytest.raises(ValueError, match="duplicate"):
+        StreamStore(fields=["a", "b", "a"])
+
+
+def test_empty_fields_raises():
+    with pytest.raises(ValueError):
+        StreamStore(fields=[])
 
 
 def test_clear_resets_state():
     store = _make_store()
-    store.append(["action", "observation", "reward", "done"],
-                 [1, np.array([1.0, 2.0]), 0.5, False], step=0)
+    store.append(steps=[0] * 4, names=["action", "observation", "reward", "done"],
+                 values=[1, np.array([1.0, 2.0]), 0.5, False])
     assert len(store) > 0
     store._clear()
     assert len(store) == 0
@@ -605,7 +681,7 @@ def test_column_order_preserved():
     store = _make_store(capacity=1024)
     store.from_dataset(_core_columns(original))
     recovered = store.to_dataset()
-    assert recovered.column_names[:5] == ["env_name", "env_number", "step_id", "action", "observation"]
+    assert recovered.column_names[:3] == ["step_id", "action", "observation"]
 
 
 # ---------------------------------------------------------------------------
@@ -618,21 +694,21 @@ def test_from_dataset_performance():
     obs_dim = 4
     ds = Dataset.from_dict(
         {
+            "action": np.random.randint(0, 3, N).tolist(),
             "observation": np.random.randn(N, obs_dim).astype(np.float32).tolist(),
             "reward": np.random.randn(N).astype(np.float32).tolist(),
             "done": [bool(i % 100 == 99) for i in range(N)],
-            "action": np.random.randint(0, 3, N).tolist(),
         },
         features=Features(
             {
+                "action": Value("int64"),
                 "observation": HFSequence(Value("float32")),
                 "reward": Value("float32"),
                 "done": Value("bool"),
-                "action": Value("int64"),
             }
         ),
     )
-    store = StreamStore(field_to_type=FIELD_TO_TYPE, env_name="test_env", env_number=0, capacity=N * 10)
+    store = StreamStore(fields=FIELDS, capacity=N * 10)
     t0 = time.time()
     store.from_dataset(ds)
     assert time.time() - t0 < 15.0, f"from_dataset too slow: {time.time() - t0:.2f}s"
@@ -643,21 +719,21 @@ def test_to_dataset_performance():
     obs_dim = 4
     ds = Dataset.from_dict(
         {
+            "action": np.random.randint(0, 3, N).tolist(),
             "observation": np.random.randn(N, obs_dim).astype(np.float32).tolist(),
             "reward": np.random.randn(N).astype(np.float32).tolist(),
             "done": [bool(i % 100 == 99) for i in range(N)],
-            "action": np.random.randint(0, 3, N).tolist(),
         },
         features=Features(
             {
+                "action": Value("int64"),
                 "observation": HFSequence(Value("float32")),
                 "reward": Value("float32"),
                 "done": Value("bool"),
-                "action": Value("int64"),
             }
         ),
     )
-    store = StreamStore(field_to_type=FIELD_TO_TYPE, env_name="test_env", env_number=0, capacity=N * (obs_dim + 3) + 1000)
+    store = StreamStore(fields=FIELDS, capacity=N * (obs_dim + 3) + 1000)
     store.from_dataset(ds)
     t0 = time.time()
     _ = store.to_dataset()
