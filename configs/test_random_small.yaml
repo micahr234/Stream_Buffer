@@ -1,0 +1,67 @@
+# Test-rollout config (train_interval=0): runs test_envs, saves dataset at end
+# Same save_dataset structure as train.yaml; uses train path (no separate rollout logic)
+name: "deploy_random_small"
+
+seed: 42
+
+# train_interval=0: loop runs num_steps times, each firing one test rollout (1 step per env)
+loop:
+  num_steps: 1000
+  train_interval: 0
+  eval_interval: 0
+  test_interval: 1
+  sequence_length: 512
+
+# Test environments; each runs for num_steps
+test_envs:
+  cartpole_train:
+    id: CartPole-v1
+    seed: null
+    num_envs: 20
+    num_steps: 1
+    policy: random
+    split: train
+    max_episode_steps: 100
+    kwargs:
+      sutton_barto_reward: true
+    render: false
+    non_stationary_params:
+      gravity:
+        scheduler: "periodic"
+        update_function: "random_walk"
+        scheduler_kwargs:
+          period: 10
+        update_kwargs:
+          sigma: 0.5
+          mu: 0.0
+          seed: null
+
+  cartpole_eval:
+    id: CartPole-v1
+    seed: null
+    num_envs: 20
+    num_steps: 1
+    policy: random
+    split: eval
+    max_episode_steps: 100
+    kwargs:
+      sutton_barto_reward: true
+    render: false
+    non_stationary_params:
+      gravity:
+        scheduler: "periodic"
+        update_function: "random_walk"
+        scheduler_kwargs:
+          period: 10
+        update_kwargs:
+          sigma: 0.5
+          mu: 0.0
+          seed: null
+
+# Save rollout data to Hugging Face after run (same as train.yaml save_dataset)
+save_dataset:
+  name: micahr234/ns_gym_data_small  # HF repo id; set to null to skip saving
+
+wandb:
+  project: "NS_Learning"
+  run_name: "deploy_random_small"

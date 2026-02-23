@@ -1,0 +1,79 @@
+# train_interval: 1 = train every step. 0 = test rollouts only (requires test_envs)
+# Experiment name
+name: "training"
+
+# Training: RNG seed (no envs required)
+seed: 42
+# env_id: null  # optional; used in saved model metadata
+
+# Training: load train dataset (name + split)
+load_train_dataset:
+  name: micahr234/ns_gym_data_large  # HF repo id or local path
+  split: train
+
+# Eval dataset (optional; used when eval_interval > 0)
+load_eval_dataset:
+  name: micahr234/ns_gym_data_large  # can be same or different dataset
+  split: eval
+
+# Q-network architecture configuration (Hugging Face Llama)
+q_network:
+  head_dim: 10      # Q head output dim; must be > max action index in any dataset (train/eval)
+  base_model_id: meta-llama/Llama-3.2-1B
+  num_hidden_layers: 12  # null = use full model depth
+  load_pretrained_backbone: false  # true = init transformer weights from base_model_id
+  torch_compile: false  # torch.compile the transformer backbone for faster fwd/bwd
+
+# Q-network training configuration
+loop:
+  num_steps: 1000000
+  max_epochs: 0  # 0 = disabled; >0 caps training to this many passes over train batches
+  batch_size: 2   # reduce if OOM
+  sequence_length: 512   # max tokens per sequence for training/eval batches
+  lr: 1e-5
+  weight_decay: 0.0
+  centering_factor: 0.1
+  gamma: 1.0        # discount factor for non-terminal transitions
+  gamma_done: 1.0    # discount factor for terminal transitions (0 = no bootstrap at done)
+  polyak_tau: 0.1   # target network soft update (0 = no target, 1 = copy every step)
+  save_model_name: null  # Set to Hugging Face model name to save, or null to not save
+  load_model_name: null  # Set to Hugging Face model name or local path to load pretrained Q-network
+  train_interval: 1   # train every N steps (0 = test rollouts only, no training)
+  eval_interval: 10   # run eval every N steps (0 = disabled); requires load_eval_dataset.name
+  eval_batch_size: 2      # number of batches to compute eval loss
+  test_interval: 100       # run online test rollout every N train steps (0 = disabled)
+  test_start_length: 512   # prefill context tokens for test rollout (0 = use sequence_length)
+  test_max_cache_length: 1024  # max KV-cache tokens during test rollout (0 = no caching)
+
+# Train-time test environments (used when loop.test_interval > 0)
+# Each env runs for num_steps steps
+test_envs:
+  cartpole_non_stationary:
+    id: CartPole-v1
+    seed: null
+    num_envs: 2
+    num_steps: 100   # steps per test rollout for this env
+    split: train
+    max_episode_steps: 100
+    kwargs:
+      sutton_barto_reward: true
+    render: false
+    non_stationary_params:
+      gravity:
+        scheduler: "periodic"
+        update_function: "random_walk"
+        scheduler_kwargs:
+          period: 10
+        update_kwargs:
+          sigma: 0.5
+          mu: 0.0
+          seed: null
+
+# Save test rollout data to Hugging Face after training (when test_interval > 0)
+save_dataset:
+  name: null  # HF repo id; set to save test rollout data
+
+# Weights & Biases logging configuration
+wandb:
+  project: "NS_Learning_Train"
+  run_name: "training"
