@@ -1,39 +1,18 @@
 """Token stream storage and HuggingFace dataset conversion.
 
-StreamStore holds a flat token stream in a single MemmapBuffer whose elements
-are a structured numpy dtype — one record per token, all channels stored
-together.  The buffer grows dynamically; pass ``capacity`` to control the
-initial allocation chunk size (default 1 M tokens).
+StreamStore holds a flat token stream in a memory-mapped buffer.  Fields are
+declared via ``define_fields`` before any data is written; each field maps to
+an integer type ID stored with every token.
 
-Design
-------
-The caller supplies a list of **fields** at construction.  Type IDs are
-auto-assigned as consecutive integers (0, 1, 2, …) in the order the fields are
-listed.  Every token written to the buffer carries that ID in its ``type``
-field so the store can identify fields across the full buffer without storing
-names repeatedly.
+Token record layout
+-------------------
+step  int64  caller-supplied step index (groups tokens into dataset rows)
+type  int64  field type ID assigned by define_fields
+data  int64  raw bit pattern of the value; interpreted via the field's feature
 
-The caller also supplies a **step index** when calling ``append`` — the store
-does not manage a counter internally.  All tokens produced by one ``append``
-call receive the same step value.  Split appends (writing different fields for
-the same step in separate calls) are fine as long as both calls pass the same
-``step`` value.
-
-Token record layout (_TOKEN_DTYPE)
-------------------------------------
-Field   dtype     Content
-------  -------   -------------------------------------------------------
-step    int64     Caller-supplied step index
-type    int64     Auto-assigned field type ID (index in the fields list)
-data    int64     Raw bits of a float64 value (reinterpret via .view(float64))
-
-All values — ints, floats, bools — are cast to float64 and stored as their
-raw int64 bit pattern.  On read, the bits are reinterpreted back to float64
-with ``.view(np.float64)``; callers then cast to the appropriate Python type.
-float64 represents all integers exactly up to 2^53.
-
-``__getitem__`` returns raw int64 bit patterns in the ``"values"`` array.
-Callers reinterpret as float64 via ``.view(np.float64)`` when needed.
+Float fields store the float64 bit pattern as int64.  Integer and bool fields
+store the int64 value directly.  The HuggingFace feature type determines which
+encoding is used on write and which reinterpretation is applied on read.
 """
 
 from __future__ import annotations
@@ -44,8 +23,6 @@ import numpy as np
 from datasets import Dataset, Features, Sequence as HFSequence, Value, load_dataset
 from memmap_buffer import MemmapBuffer
 
-# Structured dtype: one record per token.
-# All values are stored as float64 raw bits in `data` (lossless for ints up to 2^53).
 _TOKEN_DTYPE = np.dtype([
     ("step", np.int64),
     ("type", np.int64),
@@ -53,38 +30,58 @@ _TOKEN_DTYPE = np.dtype([
 ])
 
 
-def _infer_hf_feature(sample: Any) -> Value:
-    """Return the HuggingFace ``Value`` feature type for a Python scalar."""
-    if isinstance(sample, bool):
-        return Value("bool")
-    if isinstance(sample, (int, np.integer)):
-        return Value("int64")
-    if isinstance(sample, (float, np.floating)):
-        return Value("float32")
-    return Value("string")
+def _leaf_dtype(feature: Any) -> str:
+    """Return the HuggingFace leaf dtype string for a Value or Sequence feature."""
+    return feature.feature.dtype if isinstance(feature, HFSequence) else feature.dtype
+
+
+def _decode(raw: Any, dtype_str: str) -> Any:
+    """Decode a stored int64 to the value indicated by dtype_str."""
+    if np.issubdtype(np.dtype(dtype_str), np.floating):
+        return np.array([raw], dtype=np.int64).view(np.float64)[0]
+    return raw
 
 
 class StreamStore:
     """Flat token stream backed by a dynamically-growing MemmapBuffer.
 
-    Internally holds a single structured buffer of ``_TOKEN_DTYPE`` records —
-    one record per token.  The buffer grows in ``capacity``-sized chunks as
-    needed; ``capacity`` is the growth increment, not a hard cap."""
+    Call ``define_fields`` before ``append`` or any dataset I/O.
+    The buffer grows in ``capacity``-sized chunks as needed."""
 
-    def __init__(
-        self,
-        fields: list[str],
-        capacity: int = 1_000_000,
-    ) -> None:
+    def __init__(self, capacity: int = 1_000_000) -> None:
         if capacity <= 0:
             raise ValueError("capacity must be > 0.")
+        self._field_to_type:   dict[str, int] = {}
+        self._type_to_field:   dict[int, str] = {}
+        self._field_features:  dict[str, Any] = {}
+        self._field_dtype_str: dict[str, str] = {}
+        self._buf = MemmapBuffer(dtype=_TOKEN_DTYPE, size_increment=capacity)
+
+    def define_fields(
+        self,
+        fields: list[str],
+        field_features: dict[str, Any] | None = None,
+    ) -> None:
+        """Set the field-to-type mapping and HuggingFace feature types.
+
+        ``field_features`` maps field names to HuggingFace ``Value`` or
+        ``Sequence`` objects used by ``to_dataset``.  Any field not listed
+        defaults to ``Sequence(Value("int64"))``.
+
+        Raises ``RuntimeError`` if data has already been written, since
+        redefining fields would corrupt existing token type IDs.
+        """
+        if len(self._buf) > 0:
+            raise RuntimeError("Cannot redefine fields after data has been appended.")
         if not fields:
             raise ValueError("fields must not be empty.")
         if len(fields) != len(set(fields)):
             raise ValueError("fields must not contain duplicates.")
-        self._field_to_type: dict[str, int] = {f: i for i, f in enumerate(fields)}
-        self._type_to_field: dict[int, str] = {i: f for i, f in enumerate(fields)}
-        self._buf = MemmapBuffer(dtype=_TOKEN_DTYPE, size_increment=capacity)
+        ff = dict(field_features) if field_features else {}
+        self._field_to_type   = {f: i for i, f in enumerate(fields)}
+        self._type_to_field   = {i: f for i, f in enumerate(fields)}
+        self._field_features  = {f: ff.get(f, HFSequence(Value("int64"))) for f in fields}
+        self._field_dtype_str = {f: _leaf_dtype(feat) for f, feat in self._field_features.items()}
 
     # ------------------------------------------------------------------
     # Core protocol
@@ -97,34 +94,27 @@ class StreamStore:
         size = len(self._buf)
         tail_n = min(size, 5)
         if tail_n:
-            tail = self._buf[size - tail_n : size]
-            rows = ", ".join(
-                f"(step={r['step']}, type={r['type']}, "
-                f"val={np.array([r['data']], dtype=np.int64).view(np.float64)[0]:.4g})"
-                for r in tail
-            )
-            tail_str = f", tail=[{rows}]"
+            rows = []
+            for r in self._buf[size - tail_n : size]:
+                field = self._type_to_field.get(r["type"], "")
+                val   = _decode(r["data"], self._field_dtype_str.get(field, "int64"))
+                rows.append(f"(step={r['step']}, type={r['type']}, val={val:.4g})")
+            tail_str = f", tail=[{', '.join(rows)}]"
         else:
             tail_str = ""
         return f"StreamStore(size={size}{tail_str})"
 
     def __getitem__(self, indices: Any) -> dict[str, np.ndarray]:
-        """Return token records at *indices* as a dict of numpy arrays.
+        """Return token records at *indices* as ``{"step", "types", "values"}``.
 
-        *indices* may be an integer array of **any shape** (numpy or array-like).
-        Returns ``{"types": int64[...], "values": int64[...]}`` with batch
-        dimensions matching the index shape.  ``"values"`` contains the raw
-        int64 bit patterns stored in the buffer — callers reinterpret as
-        float64 via ``.view(np.float64)`` when needed.
+        *indices* may be an integer array of any shape.  ``"values"`` contains
+        raw int64 bit patterns; use ``_decode`` with the field's dtype to read.
         """
-        idx: np.ndarray = np.asarray(indices)
-        chunk = self._buf[idx]
-        # Field extraction from a structured array gives strides equal to the
-        # struct itemsize, not the field's element size; .copy() produces a
-        # fresh contiguous array with normal element-size strides.
+        chunk = self._buf[np.asarray(indices)]
+        # .copy() produces contiguous arrays with normal element-size strides.
         return {
-            "step": chunk["step"].copy(),
-            "types": chunk["type"].copy(),
+            "step":   chunk["step"].copy(),
+            "types":  chunk["type"].copy(),
             "values": chunk["data"].copy(),
         }
 
@@ -132,14 +122,12 @@ class StreamStore:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _write(self, step: int, type_id: int, data: np.ndarray) -> None:
-        """Append *n* tokens to the buffer.
+    def _require_fields(self) -> None:
+        if not self._field_to_type:
+            raise RuntimeError("Fields not defined. Call define_fields() first.")
 
-        *data* is a 1-D int64 array of raw float64 bits (one element per token).
-        All tokens receive the caller-supplied *step* value.
-        """
-        n = len(data)
-        chunk = np.empty(n, dtype=_TOKEN_DTYPE)
+    def _write(self, step: int, type_id: int, data: np.ndarray) -> None:
+        chunk = np.empty(len(data), dtype=_TOKEN_DTYPE)
         chunk["step"] = step
         chunk["type"] = type_id
         chunk["data"] = data
@@ -166,8 +154,8 @@ class StreamStore:
 
         All three sequences must have equal length.  Within a given step,
         field names must appear in ``fields`` construction order; fields may
-        be omitted and steps may repeat, but out-of-order fields for the
-        same step raise ``ValueError``.
+        be omitted but those present must be strictly ordered.  Out-of-order
+        fields for the same step raise ``ValueError``.
         """
         if not steps:
             raise ValueError("At least one token required.")
@@ -176,42 +164,42 @@ class StreamStore:
                 f"steps, names, and values must all have equal length "
                 f"(got {len(steps)}, {len(names)}, {len(values)})."
             )
+        self._require_fields()
 
         if len(self._buf) > 0:
             last = self._buf[len(self._buf) - 1]
             prev_step, prev_type_id = int(last["step"]), int(last["type"])
         else:
             prev_step, prev_type_id = -1, -1
-        
+
         for step, name, value in zip(steps, names, values):
             if name not in self._field_to_type:
                 raise ValueError(f"Unknown field {name!r}.")
             type_id = self._field_to_type[name]
-            if (step < prev_step) or (step == prev_step and type_id <= prev_type_id):
-                raise ValueError(
-                    f"Fields must be in construction order"
-                )
+            if step < prev_step or (step == prev_step and type_id <= prev_type_id):
+                raise ValueError("Fields must be in construction order.")
             prev_step, prev_type_id = step, type_id
-            arr = np.atleast_1d(np.asarray(value, dtype=np.float64))
+            arr = np.atleast_1d(np.asarray(value))
             if arr.ndim != 1:
-                raise ValueError(
-                    f"Field {name!r} must be scalar or 1-D; got shape {arr.shape}."
-                )
+                raise ValueError(f"Field {value!r} must be scalar or 1-D; got shape {arr.shape}.")
+            if arr.itemsize != 8:
+                arr = arr.astype(np.float64 if np.issubdtype(arr.dtype, np.floating) else np.int64)
             self._write(step, type_id, arr.view(np.int64))
 
     # ------------------------------------------------------------------
-    # In-memory Dataset I/O  (from_dataset / to_dataset)
+    # Dataset I/O  (from_dataset / to_dataset)
     # ------------------------------------------------------------------
 
     def from_dataset(self, ds: Dataset) -> None:
         """Load a HuggingFace Dataset object into the store.
 
-        Counterpart to ``to_dataset``.  Every column in ``ds`` is appended;
-        ``append`` raises ``ValueError`` if any column name is not a declared
-        field.  Rows are assigned step indices 0, 1, 2, … in the order they
-        appear in ``ds`` — sort the dataset before calling if a specific step
-        order is required.
+        Rows are assigned step indices 0, 1, 2, … in the order they appear in
+        ``ds`` — sort before calling if a specific step order is required.
+        If fields have not been defined yet, they are inferred from
+        ``ds.column_names`` in dataset column order.
         """
+        if not self._field_to_type:
+            self.define_fields(list(ds.features.keys()), field_features=dict(ds.features))
         self._clear()
         for i, row in enumerate(ds):
             row = cast(dict[str, Any], row)
@@ -221,88 +209,44 @@ class StreamStore:
                 values=list(row.values()),
             )
 
-    def to_dataset(
-        self,
-        field_features: dict[str, Any] | None = None,
-        extra: dict[str, list[Any]] | None = None,
-    ) -> Dataset:
+    def to_dataset(self) -> Dataset:
         """Decode the token stream to a HuggingFace Dataset object.
 
-        Counterpart to ``from_dataset``.  Each unique ``step`` value becomes
-        one row.  Column order: ``step_id``, field columns in construction
-        order, then any ``extra`` columns.
+        Counterpart to ``from_dataset``.  Each step becomes one row; each
+        field is a list of values.  Feature types come from ``define_fields``;
+        the default is ``Sequence(Value("float32"))``.
 
-        A field is stored as a variable-length sequence if any step produces
-        more than one token for it; otherwise it is stored as a scalar.
-        Pass ``field_features`` to override the inferred HuggingFace feature
-        type for any field.  Unspecified scalar fields default to
-        ``Value("float64")``; unspecified variable-length fields default to
-        ``Sequence(Value("float32"))``.
-
-        Use ``extra`` for any per-step columns that are not part of the token
-        stream — provenance, episode numbers, timestamps, etc.
+        Uses ``Dataset.from_generator`` so Arrow batches are written to disk
+        incrementally — peak RAM is independent of buffer size.
         """
+        self._require_fields()
+        features = Features(self._field_features)
         if len(self._buf) == 0:
-            raise ValueError("Store is empty.")
+            return Dataset.from_dict({f: [] for f in self._field_features}, features=features)
 
-        tokens  = self._buf[:]
-        type_np = tokens["type"]
-        step_np = tokens["step"]
-        vals_np = tokens["data"]
+        def gen() -> Any:
+            current_step: int | None = None
+            row: dict[str, list[Any]] = {}
+            for token in self._buf:
+                step  = token["step"]
+                field = self._type_to_field[token["type"]]
+                val   = _decode(token["data"], self._field_dtype_str[field])
+                if step != current_step:
+                    if current_step is not None:
+                        yield {
+                            f: (vs if isinstance(self._field_features[f], HFSequence) else vs[0])
+                            for f, vs in row.items()
+                        }
+                    current_step = step
+                    row = {}
+                row.setdefault(field, []).append(val)
+            if current_step is not None:
+                yield {
+                    f: (vs if isinstance(self._field_features[f], HFSequence) else vs[0])
+                    for f, vs in row.items()
+                }
 
-        unique_steps = np.unique(step_np)
-        num_steps    = len(unique_steps)
-
-        dataset_dict: dict[str, Any]  = {}
-        features_dict: dict[str, Any] = {}
-
-        ff = field_features or {}
-
-        for field_name, type_id in self._field_to_type.items():
-            mask = type_np == type_id
-            if not mask.any():
-                continue
-
-            field_vals  = vals_np[mask]
-            field_steps = step_np[mask]
-
-            _, counts   = np.unique(field_steps, return_counts=True)
-            is_variable = int(counts.max()) > 1
-
-            if is_variable:
-                bounds     = np.concatenate(
-                    [[0], np.flatnonzero(np.diff(field_steps)) + 1, [field_steps.size]]
-                )
-                num_groups = len(bounds) - 1
-                if num_groups != num_steps:
-                    raise ValueError(
-                        f"Field {field_name!r}: {num_groups} token groups but "
-                        f"{num_steps} steps. Every step must have at least one "
-                        f"token for this field."
-                    )
-                field_data: Any = [
-                    field_vals[int(bounds[i]):int(bounds[i + 1])].astype(np.float32).tolist()
-                    for i in range(num_groups)
-                ]
-                feature: Any = ff.get(field_name, HFSequence(Value("float32")))
-            else:
-                field_data = field_vals.tolist()
-                feature    = ff.get(field_name, Value("float64"))
-
-            dataset_dict[field_name]  = field_data
-            features_dict[field_name] = feature
-
-        if extra:
-            for col_name, col_values in extra.items():
-                if len(col_values) != num_steps:
-                    raise ValueError(
-                        f"extra column {col_name!r}: expected {num_steps} values, "
-                        f"got {len(col_values)}."
-                    )
-                dataset_dict[col_name]  = col_values
-                features_dict[col_name] = _infer_hf_feature(col_values[0])
-
-        return Dataset.from_dict(dataset_dict, features=Features(features_dict))
+        return Dataset.from_generator(gen, features=features)
 
     # ------------------------------------------------------------------
     # Hub I/O  (load_dataset / save_dataset)
@@ -317,34 +261,23 @@ class StreamStore:
         """Load a HuggingFace Hub split into the store.
 
         Counterpart to ``save_dataset``.  Downloads the named split, optionally
-        sorts it (pass ``sort_by`` with the column names that define step order
-        for your schema), strips non-field columns, then calls ``from_dataset``.
+        sorts it (pass ``sort_by`` with the column names that define step order),
+        then calls ``from_dataset``.  Filter or rename columns on the dataset
+        before calling if needed.
         """
         if not dataset_name or not dataset_split:
             raise ValueError("dataset_name and dataset_split must be non-empty.")
         ds = load_dataset(dataset_name, split=dataset_split, download_mode="force_redownload")
         if sort_by:
             ds = ds.sort(sort_by, reverse=[False] * len(sort_by))
-        canonical = list(self._field_to_type.keys())
-        present = [c for c in canonical if c in ds.column_names]
-        ds = ds.select_columns(present).cast(Features({c: ds.features[c] for c in present}))
         self.from_dataset(ds)
 
-    def save_dataset(
-        self,
-        dataset_name: str,
-        dataset_split: str,
-        field_features: dict[str, Any] | None = None,
-        extra: dict[str, list[Any]] | None = None,
-    ) -> None:
+    def save_dataset(self, dataset_name: str, dataset_split: str) -> None:
         """Push the token stream to a HuggingFace Hub dataset.
 
-        Counterpart to ``load_dataset``.  Calls ``to_dataset`` then pushes the
-        result to the Hub under ``dataset_name`` / ``dataset_split``.
-        ``field_features`` and ``extra`` are forwarded to ``to_dataset``
-        unchanged.
+        Counterpart to ``load_dataset``.  Calls ``to_dataset`` then pushes to
+        the Hub under ``dataset_name`` / ``dataset_split``.
         """
         if not dataset_name or not dataset_split:
             raise ValueError("dataset_name and dataset_split must be non-empty.")
-        ds = self.to_dataset(field_features=field_features, extra=extra)
-        ds.push_to_hub(dataset_name, split=dataset_split)
+        self.to_dataset().push_to_hub(dataset_name, split=dataset_split)

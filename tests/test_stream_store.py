@@ -35,6 +35,14 @@ _OBS_TYPE         = 1
 _REWARD_TYPE      = 2
 _DONE_TYPE        = 3
 
+# HuggingFace feature types matching the test fields.
+_STORE_FEATURES = {
+    "action":      Value("int64"),
+    "observation": HFSequence(Value("float32")),
+    "reward":      Value("float32"),
+    "done":        Value("bool"),
+}
+
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -44,7 +52,9 @@ OBS_DIM = 4
 
 
 def _make_store(capacity: int = 4096) -> StreamStore:
-    return StreamStore(fields=FIELDS, capacity=capacity)
+    store = StreamStore(capacity=capacity)
+    store.define_fields(FIELDS, field_features=_STORE_FEATURES)
+    return store
 
 
 def _core_columns(ds: Dataset) -> Dataset:
@@ -260,8 +270,8 @@ def test_getitem_done_token():
                  values=[0, obs, 0.0, True])
     result = store[torch.tensor([obs_dim + 2])]
     assert result["types"].tolist() == [_DONE_TYPE]
-    val = result["values"][0:1].view(np.float64)[0]
-    assert bool(val) is True
+    # done=True is stored as int64(1)
+    assert result["values"][0].item() == 1
 
 
 def test_getitem_action_token():
@@ -272,8 +282,8 @@ def test_getitem_action_token():
                  values=[7, obs, 0.0, False])
     result = store[torch.tensor([0])]
     assert result["types"].tolist() == [_ACTION_TYPE]
-    val = result["values"][0:1].view(np.float64)[0]
-    assert int(val) == 7
+    # action is stored as int64 directly (not a float bit-pattern)
+    assert result["values"][0].item() == 7
 
 
 def _append_steps(store, N, obs_dim):
@@ -344,13 +354,17 @@ def test_getitem_returns_tensors():
 
 
 def test_getitem_raw_bits():
-    """__getitem__ returns raw int64 bit patterns; callers reinterpret via .view(float64).
+    """__getitem__ returns raw int64 bit patterns.
+
+    - Float fields: store the float64 bit pattern as int64; recover via .view(float64).
+    - Int/bool fields: store the int64 value directly; recover by reading as int64.
 
     Checks:
       1. Returned dtype is int64.
-      2. Raw bits match float64(value).view(int64) for every token type.
-      3. Callers can recover original values by viewing the array as float64.
-      4. Large integers (2^20) survive losslessly — float64 is exact up to 2^53.
+      2. Float fields: raw bits match np.float64(value).view(int64).
+         Int/bool fields: raw bits equal the integer value directly.
+      3. Callers can recover original values using the correct reinterpretation.
+      4. Large integers (2^20) survive losslessly.
     """
     obs_val = np.pi
     reward  = -273.15
@@ -369,19 +383,21 @@ def test_getitem_raw_bits():
     # 1. dtype is raw int64
     assert vals.dtype == np.int64
 
-    # 2. Raw bits match float64(value).view(int64)
-    for token_idx, value in [(0, float(action)), (1, obs_val), (2, reward), (3, float(done))]:
-        expected_bits = int(np.float64(value).view(np.int64))
-        assert vals[token_idx].item() == expected_bits, (
-            f"Token {token_idx}: expected bits {expected_bits}, got {vals[token_idx].item()}"
-        )
+    # 2. Raw bit storage per field type
+    # action (int64): stored directly as int64
+    assert vals[0].item() == action
+    # observation (float64 bit pattern of pi)
+    assert vals[1].item() == int(np.float64(obs_val).view(np.int64))
+    # reward (float64 bit pattern of -273.15)
+    assert vals[2].item() == int(np.float64(reward).view(np.int64))
+    # done (bool → int64): stored as 1
+    assert vals[3].item() == int(done)
 
-    # 3. Caller reinterprets bits as float64 to recover original values
-    vals_f64 = vals.view(np.float64)
-    assert int(vals_f64[0]) == action
-    assert vals_f64[1] == obs_val
-    assert vals_f64[2] == reward
-    assert bool(vals_f64[3]) is done
+    # 3. Recovering values
+    assert vals[0].item() == action                            # int: read directly
+    assert vals[1:2].view(np.float64)[0] == obs_val            # float: view as float64
+    assert vals[2:3].view(np.float64)[0] == reward             # float: view as float64
+    assert bool(vals[3].item()) is done                        # bool: nonzero → True
 
 
 # ---------------------------------------------------------------------------
@@ -498,7 +514,8 @@ def test_roundtrip_no_metadata():
 # ---------------------------------------------------------------------------
 
 
-def test_to_dataset_extra_string_column():
+def test_to_dataset_roundtrip_features():
+    """to_dataset uses the feature types from define_fields for the output schema."""
     num_rows = 10
     ds = Dataset.from_dict(
         {
@@ -518,35 +535,9 @@ def test_to_dataset_extra_string_column():
     )
     store = _make_store(capacity=512)
     store.from_dataset(ds)
-    env_ids = [f"env({i})" for i in range(num_rows)]
-    recovered = store.to_dataset(extra={"env_id": env_ids})
-    assert "env_id" in recovered.column_names
-    for i in range(num_rows):
-        assert recovered[i]["env_id"] == env_ids[i]
-
-
-def test_to_dataset_extra_wrong_length_raises():
-    num_rows = 5
-    ds = Dataset.from_dict(
-        {
-            "action": [0] * num_rows,
-            "observation": [[0.0] for _ in range(num_rows)],
-            "reward": [0.0] * num_rows,
-            "done": [False] * num_rows,
-        },
-        features=Features(
-            {
-                "observation": HFSequence(Value("float32")),
-                "reward": Value("float32"),
-                "done": Value("bool"),
-                "action": Value("int64"),
-            }
-        ),
-    )
-    store = _make_store()
-    store.from_dataset(ds)
-    with pytest.raises(ValueError, match="extra column"):
-        store.to_dataset(extra={"env_id": ["x"] * (num_rows + 1)})
+    recovered = store.to_dataset()
+    assert set(recovered.column_names) == {"action", "observation", "reward", "done"}
+    assert len(recovered) == num_rows
 
 
 # ---------------------------------------------------------------------------
@@ -623,10 +614,10 @@ def test_to_dataset_variable_obs_dim():
 # ---------------------------------------------------------------------------
 
 
-def test_empty_store_raises_on_to_dataset():
+def test_empty_store_returns_empty_dataset():
     store = _make_store()
-    with pytest.raises(ValueError):
-        store.to_dataset()
+    ds = store.to_dataset()
+    assert len(ds) == 0
 
 
 def test_partial_fields_produce_valid_dataset():
@@ -637,7 +628,8 @@ def test_partial_fields_produce_valid_dataset():
     ds = store.to_dataset()
     assert len(ds) == 1
     assert "observation" in ds.column_names
-    assert "action" not in ds.column_names
+    # action was not written for this step — it is absent from the yielded row
+    assert ds[0].get("action") is None
 
 
 def test_from_dataset_grows_beyond_initial_capacity():
@@ -649,17 +641,17 @@ def test_from_dataset_grows_beyond_initial_capacity():
 
 def test_zero_capacity_raises():
     with pytest.raises(ValueError):
-        StreamStore(fields=FIELDS, capacity=0)
+        StreamStore(capacity=0)
 
 
 def test_duplicate_fields_raises():
     with pytest.raises(ValueError, match="duplicate"):
-        StreamStore(fields=["a", "b", "a"])
+        StreamStore().define_fields(["a", "b", "a"])
 
 
 def test_empty_fields_raises():
     with pytest.raises(ValueError):
-        StreamStore(fields=[])
+        StreamStore().define_fields([])
 
 
 def test_clear_resets_state():
@@ -681,7 +673,7 @@ def test_column_order_preserved():
     store = _make_store(capacity=1024)
     store.from_dataset(_core_columns(original))
     recovered = store.to_dataset()
-    assert recovered.column_names[:3] == ["step_id", "action", "observation"]
+    assert recovered.column_names == ["action", "observation", "reward", "done"]
 
 
 # ---------------------------------------------------------------------------
@@ -708,7 +700,8 @@ def test_from_dataset_performance():
             }
         ),
     )
-    store = StreamStore(fields=FIELDS, capacity=N * 10)
+    store = StreamStore(capacity=N * 10)
+    store.define_fields(FIELDS, field_features=_STORE_FEATURES)
     t0 = time.time()
     store.from_dataset(ds)
     assert time.time() - t0 < 15.0, f"from_dataset too slow: {time.time() - t0:.2f}s"
@@ -733,7 +726,8 @@ def test_to_dataset_performance():
             }
         ),
     )
-    store = StreamStore(fields=FIELDS, capacity=N * (obs_dim + 3) + 1000)
+    store = StreamStore(capacity=N * (obs_dim + 3) + 1000)
+    store.define_fields(FIELDS, field_features=_STORE_FEATURES)
     store.from_dataset(ds)
     t0 = time.time()
     _ = store.to_dataset()

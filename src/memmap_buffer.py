@@ -71,5 +71,8 @@ class MemmapBuffer:
         """Reset the buffer to empty without freeing the underlying memory."""
         self.index = 0
 
+    def __iter__(self):
+        return iter(self.storage[: self.index])
+
     def __getitem__(self, idx: Any) -> np.ndarray:
-        return np.asarray(self.storage[: self.index])[idx]
+        return self.storage[: self.index][idx]
