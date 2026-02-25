@@ -133,10 +133,10 @@ def test_append_multi_step_inserts_in_order():
     for i in range(N):
         store.append(steps=[i] * 4, names=fields,
                      values=[i, np.ones(obs_dim) * i, float(i), False])
-    raw = store._buf[:]
+    result = store[np.arange(len(store))]
     tps = obs_dim + 3
     for i in range(N):
-        assert (raw["step"][i * tps:(i + 1) * tps] == i).all()
+        assert (result["step"][i * tps:(i + 1) * tps] == i).all()
 
 
 def test_append_step_stored_in_buffer():
@@ -145,8 +145,8 @@ def test_append_step_stored_in_buffer():
     obs = np.array([1.0, 2.0], dtype=np.float32)
     store.append(steps=[42, 42, 42, 42], names=["action", "observation", "reward", "done"],
                  values=[1, obs, 0.5, False])
-    raw = store._buf[:]
-    assert (raw["step"] == 42).all()
+    result = store[np.arange(len(store))]
+    assert (result["step"] == 42).all()
 
 
 def test_append_allows_variable_obs_dim():
@@ -170,8 +170,8 @@ def test_split_append_same_step():
                  values=[obs, 0.5, False])
     assert len(store) == obs_dim + 3
 
-    raw = store._buf[:]
-    assert (raw["step"] == 7).all()
+    result = store[np.arange(len(store))]
+    assert (result["step"] == 7).all()
 
 
 def test_append_unknown_field_raises():
@@ -470,11 +470,11 @@ def test_from_dataset_step_values():
     )
     store = _make_store(capacity=512)
     store.from_dataset(ds)
-    raw = store._buf[:]
+    result = store[np.arange(len(store))]
     tps = obs_dim + 3
     for i in range(num_rows):
         s, e = i * tps, (i + 1) * tps
-        assert (raw["step"][s:e] == i).all(), f"Row {i}: step values wrong"
+        assert (result["step"][s:e] == i).all(), f"Row {i}: step values wrong"
 
 
 def test_roundtrip_no_metadata():

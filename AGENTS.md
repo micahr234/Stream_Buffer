@@ -6,25 +6,29 @@ StreamStore is a fast, memory-mapped flat buffer for sequential, multi-field dat
 
 ## Design
 
-1. **Field names map to token type IDs** — the caller declares fields via `define_fields`, which assigns each field a consecutive integer type ID. Every token carries that ID, so the store can identify field types across the full buffer without storing names repeatedly. Field names are never hardcoded inside the store — all field lookups go through `_type_to_field`.
+1. **Field names map to token type IDs** — the caller declares fields via `define_fields`, which assigns each field a consecutive integer type ID. Field names are never hardcoded inside the store — all field lookups go through `_type_to_field`.
 
-2. **Fields are stored as a sequentially concatenated flat stream** — all tokens from all steps are appended one after another in a single 1-D buffer. Any slice of token indices maps directly to a contiguous buffer region, enabling fast, zero-copy sampling of arbitrary fixed-width windows.
+2. **Data and index are stored separately** — all values are packed into a flat int64 data buffer with zero per-token metadata. A separate index table records one entry per field-write: `(start, type, step)`. Metadata for any data position is recovered at read time via `np.searchsorted` on the index table's `start` column. This keeps the data buffer compact and cache-friendly for window sampling.
 
-3. **Memmap-backed storage** — the buffer lives in a temporary memory-mapped file rather than RAM. It grows dynamically in fixed-size chunks, so arbitrarily large streams can be held without memory pressure and callers never need to know the final size in advance.
+3. **Memmap-backed storage** — both the data buffer and the index table live in temporary memory-mapped files rather than RAM. They grow dynamically in fixed-size chunks, so arbitrarily large streams can be held without memory pressure and callers never need to know the final size in advance.
 
-4. **Feature-typed encoding** — each field's HuggingFace feature determines the storage encoding. Float fields store the `float64` bit pattern as `int64`; integer and bool fields store the `int64` value directly. `_encode` / `_decode` handle the conversion using the field's dtype string derived from its feature.
+4. **Feature-typed encoding** — each field's HuggingFace feature determines the storage encoding. Float fields store the `float64` bit pattern as `int64`; integer and bool fields store the `int64` value directly. `_decode` handles the conversion using the field's dtype string derived from its feature.
 
-5. **Memory-efficient HuggingFace round-trip** — `to_dataset` iterates the buffer once token-by-token via `Dataset.from_generator`, yielding one row dict per step. Arrow batches are written to disk incrementally so peak RAM is independent of buffer size.
+5. **Memory-efficient HuggingFace round-trip** — `to_dataset` iterates the index table entry-by-entry via `Dataset.from_generator`, yielding one row dict per step. Arrow batches are written to disk incrementally so peak RAM is independent of buffer size.
 
-## Token schema
+## Storage schema
 
-Every token in the buffer is a structured record with three fields:
+**Data buffer** (`int64[]`): raw values packed contiguously — one element per scalar, multiple for sequence fields. No per-token metadata.
 
-| Field  | Role |
-|--------|------|
-| `step` | Corresponds to a **row** in a HuggingFace dataset — groups all tokens belonging to one time step. |
-| `type` | Corresponds to a **column** in a HuggingFace dataset — identifies which field this token carries, via `field_to_type`. |
-| `data` | The value itself, stored as raw `int64` bits (float bit pattern for float fields, direct int64 for int/bool fields). |
+**Index table** (one entry per field-write):
+
+| Field   | Role |
+|---------|------|
+| `start` | Offset into the data buffer where this field-write begins. |
+| `type`  | Corresponds to a **column** in a HuggingFace dataset — identifies which field this entry carries, via `field_to_type`. |
+| `step`  | Corresponds to a **row** in a HuggingFace dataset — groups entries belonging to one time step. |
+
+The length of each field-write is implicit: `next_entry.start - this_entry.start` (or `len(data_buf)` for the last entry).
 
 - **Insertion order**: within each `append` call, fields must appear in `field_to_type` key order — fields may be omitted, but those present must be strictly ordered. Steps must arrive in non-decreasing step order across calls.
 - **Loading from HuggingFace**: `from_dataset` ignores any column not in `field_to_type` and appends the remaining columns in `field_to_type` key order. The dataset rows must be in step order before calling `from_dataset`; use `load_dataset`'s `sort_by` parameter or pre-sort manually.

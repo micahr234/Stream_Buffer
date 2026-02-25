@@ -4,20 +4,15 @@ StreamStore holds a flat token stream in a memory-mapped buffer.  Fields are
 declared via ``define_fields`` before any data is written; each field maps to
 an integer type ID stored with every token.
 
-Storage layout
---------------
-Data buffer (int64[])
-    Raw bit patterns for all tokens, packed contiguously.  Float fields store
-    the float64 bit pattern as int64; integer and bool fields store the int64
-    value directly.
+Token record layout
+-------------------
+step  int64  caller-supplied step index (groups tokens into dataset rows)
+type  int64  field type ID assigned by define_fields
+data  int64  raw bit pattern of the value; interpreted via the field's feature
 
-Index table (structured array, one entry per field-write)
-    start  int64  offset into the data buffer where this field-write begins
-    type   int64  field type ID assigned by define_fields
-    step   int64  caller-supplied step index (groups tokens into dataset rows)
-
-Metadata is recovered at read time via ``np.searchsorted`` on the index
-table's ``start`` column, so the data buffer carries zero per-token overhead.
+Float fields store the float64 bit pattern as int64.  Integer and bool fields
+store the int64 value directly.  The HuggingFace feature type determines which
+encoding is used on write and which reinterpretation is applied on read.
 """
 
 from __future__ import annotations
@@ -28,10 +23,10 @@ import numpy as np
 from datasets import Dataset, Features, Sequence as HFSequence, Value, load_dataset
 from memmap_buffer import MemmapBuffer
 
-_INDEX_DTYPE = np.dtype([
-    ("start", np.int64),
-    ("type", np.int64),
+_TOKEN_DTYPE = np.dtype([
     ("step", np.int64),
+    ("type", np.int64),
+    ("data", np.int64),
 ])
 
 
@@ -47,15 +42,15 @@ def _decode(raw: Any, dtype_str: str) -> Any:
     return raw
 
 
-class StreamStore:
-    """Flat token stream backed by dynamically-growing MemmapBuffers.
+class OriginalStreamStore:
+    """Flat token stream backed by a dynamically-growing MemmapBuffer.
+
+    Original design: every token is a 24-byte structured record
+    ``(step, type, data)`` in a single buffer.  Step and type are stored
+    per-token.
 
     Call ``define_fields`` before ``append`` or any dataset I/O.
-
-    Internally, values are stored in a contiguous int64 data buffer.  A
-    separate index table (one entry per field-write) records the start
-    offset, type ID, and step of each entry, enabling metadata recovery
-    via binary search without per-token overhead."""
+    The buffer grows in ``capacity``-sized chunks as needed."""
 
     def __init__(self, capacity: int = 1_000_000) -> None:
         if capacity <= 0:
@@ -64,8 +59,7 @@ class StreamStore:
         self._type_to_field:   dict[int, str] = {}
         self._field_features:  dict[str, Any] = {}
         self._field_dtype_str: dict[str, str] = {}
-        self._data_buf = MemmapBuffer(dtype=np.int64, size_increment=capacity)
-        self._idx_buf = MemmapBuffer(dtype=_INDEX_DTYPE, size_increment=capacity)
+        self._buf = MemmapBuffer(dtype=_TOKEN_DTYPE, size_increment=capacity)
 
     def define_fields(
         self,
@@ -81,7 +75,7 @@ class StreamStore:
         Raises ``RuntimeError`` if data has already been written, since
         redefining fields would corrupt existing token type IDs.
         """
-        if len(self._data_buf) > 0:
+        if len(self._buf) > 0:
             raise RuntimeError("Cannot redefine fields after data has been appended.")
         if not fields:
             raise ValueError("fields must not be empty.")
@@ -98,23 +92,21 @@ class StreamStore:
     # ------------------------------------------------------------------
 
     def __len__(self) -> int:
-        return len(self._data_buf)
+        return len(self._buf)
 
     def __repr__(self) -> str:
-        size = len(self._data_buf)
+        size = len(self._buf)
         tail_n = min(size, 5)
         if tail_n:
-            positions = np.arange(size - tail_n, size)
-            result = self[positions]
             rows = []
-            for i in range(tail_n):
-                field = self._type_to_field.get(int(result["types"][i]), "")
-                val = _decode(int(result["values"][i]), self._field_dtype_str.get(field, "int64"))
-                rows.append(f"(step={int(result['step'][i])}, type={int(result['types'][i])}, val={val:.4g})")
+            for r in self._buf[size - tail_n : size]:
+                field = self._type_to_field.get(r["type"], "")
+                val   = _decode(r["data"], self._field_dtype_str.get(field, "int64"))
+                rows.append(f"(step={r['step']}, type={r['type']}, val={val:.4g})")
             tail_str = f", tail=[{', '.join(rows)}]"
         else:
             tail_str = ""
-        return f"StreamStore(size={size}{tail_str})"
+        return f"OriginalStreamStore(size={size}{tail_str})"
 
     def __getitem__(self, indices: Any) -> dict[str, np.ndarray]:
         """Return token records at *indices* as ``{"step", "types", "values"}``.
@@ -122,20 +114,12 @@ class StreamStore:
         *indices* may be an integer array of any shape.  ``"values"`` contains
         raw int64 bit patterns; use ``_decode`` with the field's dtype to read.
         """
-        indices = np.asarray(indices)
-        values = self._data_buf[indices]
-
-        idx_live = self._idx_buf.storage[: self._idx_buf.index]
-        starts = idx_live["start"]
-        entry_idx = np.searchsorted(starts, indices.ravel(), side="right") - 1
-
-        types = idx_live["type"][entry_idx].reshape(indices.shape)
-        steps = idx_live["step"][entry_idx].reshape(indices.shape)
-
+        chunk = self._buf[np.asarray(indices)]
+        # .copy() produces contiguous arrays with normal element-size strides.
         return {
-            "step":   steps.copy(),
-            "types":  types.copy(),
-            "values": values.copy(),
+            "step":   chunk["step"].copy(),
+            "types":  chunk["type"].copy(),
+            "values": chunk["data"].copy(),
         }
 
     # ------------------------------------------------------------------
@@ -147,13 +131,14 @@ class StreamStore:
             raise RuntimeError("Fields not defined. Call define_fields() first.")
 
     def _write(self, step: int, type_id: int, data: np.ndarray) -> None:
-        start = len(self._data_buf)
-        self._data_buf.append(data)
-        self._idx_buf.append(np.array([(start, type_id, step)], dtype=_INDEX_DTYPE))
+        chunk = np.empty(len(data), dtype=_TOKEN_DTYPE)
+        chunk["step"] = step
+        chunk["type"] = type_id
+        chunk["data"] = data
+        self._buf.append(chunk)
 
     def _clear(self) -> None:
-        self._data_buf.reset()
-        self._idx_buf.reset()
+        self._buf.reset()
 
     # ------------------------------------------------------------------
     # Online append
@@ -185,8 +170,8 @@ class StreamStore:
             )
         self._require_fields()
 
-        if len(self._idx_buf) > 0:
-            last = self._idx_buf[len(self._idx_buf) - 1]
+        if len(self._buf) > 0:
+            last = self._buf[len(self._buf) - 1]
             prev_step, prev_type_id = int(last["step"]), int(last["type"])
         else:
             prev_step, prev_type_id = -1, -1
@@ -212,8 +197,8 @@ class StreamStore:
     def from_dataset(self, ds: Dataset) -> None:
         """Load a HuggingFace Dataset object into the store.
 
-        Rows are assigned step indices 0, 1, 2, ... in the order they appear in
-        ``ds`` -- sort before calling if a specific step order is required.
+        Rows are assigned step indices 0, 1, 2, … in the order they appear in
+        ``ds`` — sort before calling if a specific step order is required.
         If fields have not been defined yet, they are inferred from
         ``ds.column_names`` in dataset column order.
         """
@@ -236,27 +221,20 @@ class StreamStore:
         the default is ``Sequence(Value("float32"))``.
 
         Uses ``Dataset.from_generator`` so Arrow batches are written to disk
-        incrementally -- peak RAM is independent of buffer size.
+        incrementally — peak RAM is independent of buffer size.
         """
         self._require_fields()
         features = Features(self._field_features)
-        if len(self._data_buf) == 0:
+        if len(self._buf) == 0:
             return Dataset.from_dict({f: [] for f in self._field_features}, features=features)
 
         def gen() -> Any:
             current_step: int | None = None
             row: dict[str, list[Any]] = {}
-            n_entries = len(self._idx_buf)
-            idx_all = self._idx_buf.storage[:n_entries]
-            data_all = self._data_buf.storage[: len(self._data_buf)]
-
-            for i in range(n_entries):
-                entry = idx_all[i]
-                start = int(entry["start"])
-                end = int(idx_all[i + 1]["start"]) if i + 1 < n_entries else len(self._data_buf)
-                step = int(entry["step"])
-                field = self._type_to_field[int(entry["type"])]
-
+            for token in self._buf:
+                step  = token["step"]
+                field = self._type_to_field[token["type"]]
+                val   = _decode(token["data"], self._field_dtype_str[field])
                 if step != current_step:
                     if current_step is not None:
                         yield {
@@ -265,18 +243,14 @@ class StreamStore:
                         }
                     current_step = step
                     row = {}
-
-                dtype_str = self._field_dtype_str[field]
-                vals = [_decode(int(v), dtype_str) for v in data_all[start:end]]
-                row.setdefault(field, []).extend(vals)
-
+                row.setdefault(field, []).append(val)
             if current_step is not None:
                 yield {
                     f: (vs if isinstance(self._field_features[f], HFSequence) else vs[0])
                     for f, vs in row.items()
                 }
 
-        return cast(Dataset, Dataset.from_generator(gen, features=features))
+        return Dataset.from_generator(gen, features=features)
 
     # ------------------------------------------------------------------
     # Hub I/O  (load_dataset / save_dataset)

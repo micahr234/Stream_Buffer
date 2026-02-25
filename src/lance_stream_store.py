@@ -1,37 +1,41 @@
-"""Token stream storage and HuggingFace dataset conversion.
+"""Lance-backed token stream storage and HuggingFace dataset conversion.
 
-StreamStore holds a flat token stream in a memory-mapped buffer.  Fields are
-declared via ``define_fields`` before any data is written; each field maps to
-an integer type ID stored with every token.
+LanceStreamStore holds a flat token stream using the Lance columnar format.
+Fields are declared via ``define_fields`` before any data is written; each
+field maps to an integer type ID stored per token.
 
-Storage layout
---------------
-Data buffer (int64[])
-    Raw bit patterns for all tokens, packed contiguously.  Float fields store
-    the float64 bit pattern as int64; integer and bool fields store the int64
-    value directly.
+Lance dataset columns
+---------------------
+value  int64  raw bit pattern of the token value
+type   int64  field type ID assigned by define_fields
+step   int64  caller-supplied step index (groups tokens into dataset rows)
 
-Index table (structured array, one entry per field-write)
-    start  int64  offset into the data buffer where this field-write begins
-    type   int64  field type ID assigned by define_fields
-    step   int64  caller-supplied step index (groups tokens into dataset rows)
+Lance stores each column separately on disk, so reads that only need values
+skip the type/step columns entirely — achieving the same I/O separation as
+the split-buffer design, with built-in compression and cloud-compatible
+persistence.
 
-Metadata is recovered at read time via ``np.searchsorted`` on the index
-table's ``start`` column, so the data buffer carries zero per-token overhead.
+Writes are buffered in memory and flushed to Lance in batches to avoid
+creating many small fragments.
 """
 
 from __future__ import annotations
 
+import os
+import shutil
+import tempfile
 from typing import Any, Sequence, cast
 
+import lance
 import numpy as np
-from datasets import Dataset, Features, Sequence as HFSequence, Value, load_dataset
-from memmap_buffer import MemmapBuffer
+import pyarrow as pa
+from datasets import Dataset, Features, Sequence as HFSequence, Value
+from datasets import load_dataset as hf_load_dataset
 
-_INDEX_DTYPE = np.dtype([
-    ("start", np.int64),
-    ("type", np.int64),
-    ("step", np.int64),
+_LANCE_SCHEMA = pa.schema([
+    pa.field("value", pa.int64()),
+    pa.field("type", pa.int64()),
+    pa.field("step", pa.int64()),
 ])
 
 
@@ -47,25 +51,82 @@ def _decode(raw: Any, dtype_str: str) -> Any:
     return raw
 
 
-class StreamStore:
-    """Flat token stream backed by dynamically-growing MemmapBuffers.
+class LanceStreamStore:
+    """Flat token stream backed by a Lance dataset.
 
     Call ``define_fields`` before ``append`` or any dataset I/O.
 
-    Internally, values are stored in a contiguous int64 data buffer.  A
-    separate index table (one entry per field-write) records the start
-    offset, type ID, and step of each entry, enabling metadata recovery
-    via binary search without per-token overhead."""
+    Writes are buffered in memory and flushed to Lance when the buffer
+    exceeds ``capacity`` tokens.  Reads serve from both the flushed Lance
+    data and the pending buffer without forcing a flush, so no unnecessary
+    fragments are created."""
 
-    def __init__(self, capacity: int = 1_000_000) -> None:
+    def __init__(self, capacity: int = 1_000_000, path: str | None = None) -> None:
         if capacity <= 0:
             raise ValueError("capacity must be > 0.")
         self._field_to_type:   dict[str, int] = {}
         self._type_to_field:   dict[int, str] = {}
         self._field_features:  dict[str, Any] = {}
         self._field_dtype_str: dict[str, str] = {}
-        self._data_buf = MemmapBuffer(dtype=np.int64, size_increment=capacity)
-        self._idx_buf = MemmapBuffer(dtype=_INDEX_DTYPE, size_increment=capacity)
+
+        self._owns_path = path is None
+        if path is None:
+            self._dir = tempfile.mkdtemp()
+            self._path = os.path.join(self._dir, "stream.lance")
+        else:
+            self._dir = os.path.dirname(os.path.abspath(path))
+            self._path = path
+
+        self._ds: lance.LanceDataset | None = None
+        self._flushed_count: int = 0
+        self._flush_threshold: int = capacity
+
+        self._pending_values: list[int] = []
+        self._pending_types:  list[int] = []
+        self._pending_steps:  list[int] = []
+
+        self._prev_step: int = -1
+        self._prev_type_id: int = -1
+
+    def close(self) -> None:
+        """Release the Lance dataset and clean up temp files if owned."""
+        self._ds = None
+        if self._owns_path and os.path.isdir(self._dir):
+            shutil.rmtree(self._dir, ignore_errors=True)
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Lance flush
+    # ------------------------------------------------------------------
+
+    def _flush(self) -> None:
+        if not self._pending_values:
+            return
+        table = pa.table(
+            {
+                "value": pa.array(self._pending_values, type=pa.int64()),
+                "type":  pa.array(self._pending_types,  type=pa.int64()),
+                "step":  pa.array(self._pending_steps,  type=pa.int64()),
+            },
+            schema=_LANCE_SCHEMA,
+        )
+        if self._ds is None:
+            self._ds = lance.write_dataset(table, self._path)
+        else:
+            self._ds = lance.write_dataset(table, self._path, mode="append")
+        self._flushed_count += len(self._pending_values)
+        self._pending_values.clear()
+        self._pending_types.clear()
+        self._pending_steps.clear()
+
+    # ------------------------------------------------------------------
+    # Field definitions
+    # ------------------------------------------------------------------
 
     def define_fields(
         self,
@@ -81,7 +142,7 @@ class StreamStore:
         Raises ``RuntimeError`` if data has already been written, since
         redefining fields would corrupt existing token type IDs.
         """
-        if len(self._data_buf) > 0:
+        if self._flushed_count > 0 or self._pending_values:
             raise RuntimeError("Cannot redefine fields after data has been appended.")
         if not fields:
             raise ValueError("fields must not be empty.")
@@ -98,10 +159,10 @@ class StreamStore:
     # ------------------------------------------------------------------
 
     def __len__(self) -> int:
-        return len(self._data_buf)
+        return self._flushed_count + len(self._pending_values)
 
     def __repr__(self) -> str:
-        size = len(self._data_buf)
+        size = len(self)
         tail_n = min(size, 5)
         if tail_n:
             positions = np.arange(size - tail_n, size)
@@ -114,28 +175,49 @@ class StreamStore:
             tail_str = f", tail=[{', '.join(rows)}]"
         else:
             tail_str = ""
-        return f"StreamStore(size={size}{tail_str})"
+        return f"LanceStreamStore(size={size}{tail_str})"
 
     def __getitem__(self, indices: Any) -> dict[str, np.ndarray]:
         """Return token records at *indices* as ``{"step", "types", "values"}``.
 
         *indices* may be an integer array of any shape.  ``"values"`` contains
         raw int64 bit patterns; use ``_decode`` with the field's dtype to read.
+
+        Reads serve from both the flushed Lance dataset and the in-memory
+        pending buffer without forcing a flush.
         """
         indices = np.asarray(indices)
-        values = self._data_buf[indices]
+        shape = indices.shape
+        flat = indices.ravel()
+        n = len(flat)
 
-        idx_live = self._idx_buf.storage[: self._idx_buf.index]
-        starts = idx_live["start"]
-        entry_idx = np.searchsorted(starts, indices.ravel(), side="right") - 1
+        values = np.empty(n, dtype=np.int64)
+        types  = np.empty(n, dtype=np.int64)
+        steps  = np.empty(n, dtype=np.int64)
 
-        types = idx_live["type"][entry_idx].reshape(indices.shape)
-        steps = idx_live["step"][entry_idx].reshape(indices.shape)
+        flushed_mask = flat < self._flushed_count
+
+        if flushed_mask.any() and self._ds is not None:
+            lance_idx = flat[flushed_mask].tolist()
+            table = self._ds.take(lance_idx, columns=["value", "type", "step"])
+            values[flushed_mask] = table.column("value").to_numpy()
+            types[flushed_mask]  = table.column("type").to_numpy()
+            steps[flushed_mask]  = table.column("step").to_numpy()
+
+        pending_mask = ~flushed_mask
+        if pending_mask.any():
+            pv = np.array(self._pending_values, dtype=np.int64)
+            pt = np.array(self._pending_types,  dtype=np.int64)
+            ps = np.array(self._pending_steps,  dtype=np.int64)
+            local = flat[pending_mask] - self._flushed_count
+            values[pending_mask] = pv[local]
+            types[pending_mask]  = pt[local]
+            steps[pending_mask]  = ps[local]
 
         return {
-            "step":   steps.copy(),
-            "types":  types.copy(),
-            "values": values.copy(),
+            "step":   steps.reshape(shape).copy(),
+            "types":  types.reshape(shape).copy(),
+            "values": values.reshape(shape).copy(),
         }
 
     # ------------------------------------------------------------------
@@ -147,13 +229,23 @@ class StreamStore:
             raise RuntimeError("Fields not defined. Call define_fields() first.")
 
     def _write(self, step: int, type_id: int, data: np.ndarray) -> None:
-        start = len(self._data_buf)
-        self._data_buf.append(data)
-        self._idx_buf.append(np.array([(start, type_id, step)], dtype=_INDEX_DTYPE))
+        n = len(data)
+        self._pending_values.extend(data.tolist())
+        self._pending_types.extend([type_id] * n)
+        self._pending_steps.extend([step] * n)
+        if len(self._pending_values) >= self._flush_threshold:
+            self._flush()
 
     def _clear(self) -> None:
-        self._data_buf.reset()
-        self._idx_buf.reset()
+        self._pending_values.clear()
+        self._pending_types.clear()
+        self._pending_steps.clear()
+        self._flushed_count = 0
+        self._prev_step = -1
+        self._prev_type_id = -1
+        self._ds = None
+        if os.path.exists(self._path):
+            shutil.rmtree(self._path, ignore_errors=True)
 
     # ------------------------------------------------------------------
     # Online append
@@ -185,11 +277,7 @@ class StreamStore:
             )
         self._require_fields()
 
-        if len(self._idx_buf) > 0:
-            last = self._idx_buf[len(self._idx_buf) - 1]
-            prev_step, prev_type_id = int(last["step"]), int(last["type"])
-        else:
-            prev_step, prev_type_id = -1, -1
+        prev_step, prev_type_id = self._prev_step, self._prev_type_id
 
         for step, name, value in zip(steps, names, values):
             if name not in self._field_to_type:
@@ -204,6 +292,8 @@ class StreamStore:
             if arr.itemsize != 8:
                 arr = arr.astype(np.float64 if np.issubdtype(arr.dtype, np.floating) else np.int64)
             self._write(step, type_id, arr.view(np.int64))
+
+        self._prev_step, self._prev_type_id = prev_step, prev_type_id
 
     # ------------------------------------------------------------------
     # Dataset I/O  (from_dataset / to_dataset)
@@ -240,35 +330,37 @@ class StreamStore:
         """
         self._require_fields()
         features = Features(self._field_features)
-        if len(self._data_buf) == 0:
+        total = len(self)
+        if total == 0:
             return Dataset.from_dict({f: [] for f in self._field_features}, features=features)
+
+        self._flush()
 
         def gen() -> Any:
             current_step: int | None = None
             row: dict[str, list[Any]] = {}
-            n_entries = len(self._idx_buf)
-            idx_all = self._idx_buf.storage[:n_entries]
-            data_all = self._data_buf.storage[: len(self._data_buf)]
 
-            for i in range(n_entries):
-                entry = idx_all[i]
-                start = int(entry["start"])
-                end = int(idx_all[i + 1]["start"]) if i + 1 < n_entries else len(self._data_buf)
-                step = int(entry["step"])
-                field = self._type_to_field[int(entry["type"])]
+            for batch in self._ds.to_batches():  # type: ignore[union-attr]
+                batch_values = batch.column("value").to_numpy()
+                batch_types  = batch.column("type").to_numpy()
+                batch_steps  = batch.column("step").to_numpy()
 
-                if step != current_step:
-                    if current_step is not None:
-                        yield {
-                            f: (vs if isinstance(self._field_features[f], HFSequence) else vs[0])
-                            for f, vs in row.items()
-                        }
-                    current_step = step
-                    row = {}
+                for i in range(len(batch)):
+                    step    = int(batch_steps[i])
+                    type_id = int(batch_types[i])
+                    field   = self._type_to_field[type_id]
+                    val     = _decode(int(batch_values[i]), self._field_dtype_str[field])
 
-                dtype_str = self._field_dtype_str[field]
-                vals = [_decode(int(v), dtype_str) for v in data_all[start:end]]
-                row.setdefault(field, []).extend(vals)
+                    if step != current_step:
+                        if current_step is not None:
+                            yield {
+                                f: (vs if isinstance(self._field_features[f], HFSequence) else vs[0])
+                                for f, vs in row.items()
+                            }
+                        current_step = step
+                        row = {}
+
+                    row.setdefault(field, []).append(val)
 
             if current_step is not None:
                 yield {
@@ -297,7 +389,7 @@ class StreamStore:
         """
         if not dataset_name or not dataset_split:
             raise ValueError("dataset_name and dataset_split must be non-empty.")
-        ds = load_dataset(dataset_name, split=dataset_split, download_mode="force_redownload")
+        ds = hf_load_dataset(dataset_name, split=dataset_split, download_mode="force_redownload")
         if sort_by:
             ds = ds.sort(sort_by, reverse=[False] * len(sort_by))
         self.from_dataset(ds)
